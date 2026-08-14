@@ -1,0 +1,152 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "autoname": "format:PAY-{#####}",
+ "creation": "2026-08-12 18:12:16.965025",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "erp_information_section",
+  "erp_invoice",
+  "install_no",
+  "mobile",
+  "payment_information_section",
+  "amount",
+  "currency",
+  "payment_status",
+  "column_break_nstg",
+  "otp_hash",
+  "otp_status",
+  "otp_verified_at",
+  "bank_information_section",
+  "bank_reference",
+  "failure_reason",
+  "processed_at",
+  "column_break_qnwj",
+  "otp_attempts"
+ ],
+ "fields": [
+  {
+   "fieldname": "erp_information_section",
+   "fieldtype": "Section Break",
+   "label": "ERP Information"
+  },
+  {
+   "fieldname": "erp_invoice",
+   "fieldtype": "Data",
+   "label": "ERP Invoice"
+  },
+  {
+   "fieldname": "install_no",
+   "fieldtype": "Int",
+   "label": "Install No"
+  },
+  {
+   "fieldname": "mobile",
+   "fieldtype": "Data",
+   "label": "Mobile"
+  },
+  {
+   "fieldname": "payment_information_section",
+   "fieldtype": "Section Break",
+   "label": "Payment Information"
+  },
+  {
+   "fieldname": "amount",
+   "fieldtype": "Currency",
+   "label": "Amount"
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Data",
+   "label": "Currency"
+  },
+  {
+   "fieldname": "payment_status",
+   "fieldtype": "Select",
+   "label": "Payment Status",
+   "options": "Pending\nProcessing\nSuccess\nFailed"
+  },
+  {
+   "fieldname": "otp_hash",
+   "fieldtype": "Data",
+   "label": "OTP Hash"
+  },
+  {
+   "fieldname": "otp_status",
+   "fieldtype": "Select",
+   "label": "OTP Status",
+   "options": "Pending\nVerified"
+  },
+  {
+   "fieldname": "otp_verified_at",
+   "fieldtype": "Datetime",
+   "label": "OTP Verified At"
+  },
+  {
+   "fieldname": "bank_information_section",
+   "fieldtype": "Section Break",
+   "label": "Bank Information"
+  },
+  {
+   "fieldname": "bank_reference",
+   "fieldtype": "Data",
+   "label": "Bank Reference"
+  },
+  {
+   "fieldname": "failure_reason",
+   "fieldtype": "Small Text",
+   "label": "Failure Reason"
+  },
+  {
+   "fieldname": "processed_at",
+   "fieldtype": "Datetime",
+   "label": "Processed At"
+  },
+  {
+   "fieldname": "otp_attempts",
+   "fieldtype": "Int",
+   "label": "OTP Attempts"
+  },
+  {
+   "fieldname": "column_break_nstg",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "column_break_qnwj",
+   "fieldtype": "Column Break"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-08-13 17:15:57.295275",
+ "modified_by": "Administrator",
+ "module": "Integration",
+ "name": "Payment Transaction",
+ "naming_rule": "Expression (old style)",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1,
+ "track_seen": 1,
+ "track_views": 1
+}
