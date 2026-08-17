@@ -256,3 +256,10 @@ app_license = "mit"
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
 
+scheduler_events = {
+    "cron": {
+        "*/1 * * * *": [
+            "middleware_app.api.payment.check_pending_payments"
+        ]
+    }
+}

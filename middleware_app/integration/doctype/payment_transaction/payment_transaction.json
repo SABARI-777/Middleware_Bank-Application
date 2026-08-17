@@ -12,13 +12,10 @@
   "install_no",
   "mobile",
   "payment_information_section",
-  "amount",
   "currency",
-  "payment_status",
+  "amount",
   "column_break_nstg",
-  "otp_hash",
-  "otp_status",
-  "otp_verified_at",
+  "payment_status",
   "bank_information_section",
   "bank_reference",
   "failure_reason",
@@ -69,22 +66,6 @@
    "options": "Pending\nProcessing\nSuccess\nFailed"
   },
   {
-   "fieldname": "otp_hash",
-   "fieldtype": "Data",
-   "label": "OTP Hash"
-  },
-  {
-   "fieldname": "otp_status",
-   "fieldtype": "Select",
-   "label": "OTP Status",
-   "options": "Pending\nVerified"
-  },
-  {
-   "fieldname": "otp_verified_at",
-   "fieldtype": "Datetime",
-   "label": "OTP Verified At"
-  },
-  {
    "fieldname": "bank_information_section",
    "fieldtype": "Section Break",
    "label": "Bank Information"
@@ -121,7 +102,7 @@
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-08-13 17:15:57.295275",
+ "modified": "2026-08-17 21:28:25.002933",
  "modified_by": "Administrator",
  "module": "Integration",
  "name": "Payment Transaction",
