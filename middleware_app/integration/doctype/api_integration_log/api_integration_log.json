@@ -42,7 +42,7 @@
    "fieldname": "integration_type",
    "fieldtype": "Select",
    "label": "Integration Type",
-   "options": "ERP \u2192 Middleware\nMiddleware \u2192 Bank"
+   "options": "ERP \u2192 Middleware\nMiddleware \u2192 Bank\nMiddleware \u2190 Bank\nERP \u2190 Middleware"
   },
   {
    "fieldname": "request_information_section",
@@ -94,7 +94,7 @@
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-08-13 17:44:51.854927",
+ "modified": "2026-08-18 10:39:16.655623",
  "modified_by": "Administrator",
  "module": "Integration",
  "name": "API Integration Log",
