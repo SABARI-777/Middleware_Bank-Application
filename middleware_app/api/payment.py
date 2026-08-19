@@ -69,9 +69,7 @@ def verify_otp(
     invoice_id=None,
     mobile=None,
     install_no=None,
-    receiver_bank_account=None,
-    mode_of_payment=None,
-    sender_account=None
+    receiver_bank_account=None,mode_of_payment=None, sender_account=None
 ):
     if not otp_verification_id or not otp:
         frappe.throw("OTP Verification ID and OTP are required.")
@@ -202,17 +200,21 @@ def mock_bank_initiate_payment(transaction_id, account_number, amount, mode_of_p
     except Exception:
         result = {"response_message": response.text}
 
-    
-    # create_api_log(
-    #     transaction_id=transaction_id,
-    #     event_type="PROCESS_PAYMENT",
-    #     integration_type="Middleware → Bank",
-    #     endpoint=url,
-    #     request_data=json.dumps(payload),
-    #     response_data=json.dumps(result),
-    #     http_status=200,
-    #     success=True
-    # )
+    create_api_log(
+    transaction_id=transaction_id,
+    event_type="PROCESS_PAYMENT",
+    integration_type="Middleware → Bank",
+    endpoint=url,
+    request_data=json.dumps(payload),
+    response_data=json.dumps(result),
+    http_status=response.status_code,
+    success=response.status_code in [200, 202],
+    error_message=(
+        result.get("response_message")
+        if response.status_code not in [200, 202]
+        else None
+    )
+    )
 
     return {
         "success": response.status_code in [200, 202],
@@ -245,6 +247,29 @@ def process_payment(
         transaction = frappe.get_doc("Payment Transaction", transaction_id)
     except frappe.DoesNotExistError:
         return {"success": False, "status": "FAILED", "message": "Payment transaction not found."}
+
+    create_api_log(
+        transaction_id=transaction_id,
+        event_type="START_PAYMENT",
+        integration_type="ERP → Middleware",
+        endpoint="/api/method/middleware_app.api.payment.process_payment",
+        request_data=json.dumps({
+            "transaction_id": transaction_id,
+            "amount": amount,
+            "invoice_id": invoice_id,
+            "mobile": mobile,
+            "receiver_bank_account": receiver_bank_account,
+            "receiver_account_number": receiver_account_number,
+            "mode_of_payment": mode_of_payment,
+            "sender_account": sender_account,
+            "install_no": install_no
+        }),
+        response_data=json.dumps({
+            "message": "Payment processing started."
+        }),
+        http_status=200,
+        success=True
+    )
 
 
     if transaction.payment_status == "Success":
@@ -324,6 +349,7 @@ def process_payment(
         transaction.failure_reason = bank_result.get("message") or "Bank declined payment."
         transaction.processed_at = now()
         transaction.save(ignore_permissions=True)
+    
 
         return {
             "success": False,
@@ -349,12 +375,70 @@ def get_payment_status_from_bank(transaction):
         "Accept": "application/json"
     }
 
+    request_data = {
+    "unique_id": transaction.name
+    }
+
     try:
-        response = requests.post(url, headers=headers, json={"unique_id": transaction.name}, timeout=30)
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=request_data,
+            timeout=30
+        )
+
+        try:
+            result = response.json()
+
+        except Exception:
+            result = {
+                "response_message": response.text
+            }
+
+
+        create_api_log(
+            transaction_id=transaction.name,
+            event_type="PAYMENT_STATUS",
+            integration_type="Middleware → Bank",
+            endpoint=url,
+            request_data=json.dumps(request_data),
+            response_data=json.dumps(result),
+            http_status=response.status_code,
+            success=response.status_code in [200, 202],
+            error_message=(
+                result.get("response_message")
+                if response.status_code not in [200, 202]
+                else None
+            )
+        )
+
+
         if response.status_code in [200, 202]:
-            return response.json()
+            return result
+
+
     except Exception as e:
-        frappe.log_error(frappe.get_traceback(), f"Bank Polling Network Failure - {transaction.name}")
+
+        create_api_log(
+            transaction_id=transaction.name,
+            event_type="PAYMENT_STATUS",
+            integration_type="Middleware → Bank",
+            endpoint=url,
+            request_data=json.dumps(request_data),
+            response_data=json.dumps({
+                "error": str(e)
+            }),
+            http_status=500,
+            success=False,
+            error_message=str(e)
+        )
+
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Bank Polling Network Failure - {transaction.name}"
+        )
+
     return None
 
 
@@ -430,10 +514,10 @@ def check_pending_payments():
         order_by="creation asc"
     )
 
-    frappe.log_error(
-        "AUTOMATIC SCHEDULER TEST",
-        "Middleware Scheduler"
-    )
+    # frappe.log_error(
+    #     "AUTOMATIC SCHEDULER TEST",
+    #     "Middleware Scheduler"
+    # )
 
     for transaction in pending_transactions:
         try:
@@ -461,10 +545,11 @@ def remove_pending_otp():
         filters={"status": "Pending"},
         fields=["name"]
     )
-    frappe.log_error(
-    "AUTOMATIC SCHEDULER TEST",
-        "Middleware Scheduler"
-    )
+
+    # frappe.log_error(
+    # "AUTOMATIC SCHEDULER TEST",
+    #     "Middleware Scheduler"
+    # )
 
     for otp in pending_otps:
         print(otp,"DELETED FROM OTP DOCTYPE VIA HOOKS")
