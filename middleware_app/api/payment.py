@@ -1,9 +1,9 @@
-import frappe
-import random
 import hashlib
 import json
+import random
 import requests
-from frappe.utils import now, flt
+import frappe
+from frappe.utils import flt, now
 from middleware_app.api.logs import create_api_log
 
 
@@ -27,7 +27,7 @@ def request_otp(mobile):
         frappe.throw("Mobile number is required.")
 
     otp = generate_otp()
-    print(otp,mobile)
+    print(otp)
     otp_hash_value = hash_otp(otp)
 
     verification = frappe.get_doc({
@@ -48,16 +48,19 @@ def request_otp(mobile):
         "message": "OTP dispatched successfully."
     }
 
-    create_api_log(
-        transaction_id=verification.name,
-        event_type="GENERATE_OTP",
-        integration_type="ERP → Middleware",
-        endpoint="/api/method/middleware_app.api.payment.request_otp",
-        request_data=json.dumps({"mobile": mobile}),
-        response_data=json.dumps(response_data),
-        http_status=200,
-        success=True
-    )
+    try:
+        create_api_log(
+            transaction_id=verification.name,
+            event_type="GENERATE_OTP",
+            integration_type="ERP → Middleware",
+            endpoint="/api/method/middleware_app.api.payment.request_otp",
+            request_data={"mobile": mobile},
+            response_data=response_data,
+            http_status=200,
+            success=True
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Request {verification.name}")
 
     return response_data
 
@@ -69,7 +72,10 @@ def verify_otp(
     invoice_id=None,
     mobile=None,
     install_no=None,
-    receiver_bank_account=None,mode_of_payment=None, sender_account=None
+    receiver_bank_account=None,
+    receiver_account_number=None,
+    mode_of_payment=None,
+    sender_account=None
 ):
     if not otp_verification_id or not otp:
         frappe.throw("OTP Verification ID and OTP are required.")
@@ -106,17 +112,21 @@ def verify_otp(
             "message": "Invalid OTP entered."
         }
 
-        create_api_log(
-            transaction_id=otp_verification_id,
-            event_type="VERIFY_OTP",
-            integration_type="ERP → Middleware",
-            endpoint="/api/method/middleware_app.api.payment.verify_otp",
-            request_data=json.dumps({"otp_verification_id": otp_verification_id, "attempt": verification.attempt_count}),
-            response_data=json.dumps(response_data),
-            http_status=200,
-            success=False,
-            error_message="OTP Mismatch"
-        )
+        try:
+            create_api_log(
+                transaction_id=otp_verification_id,
+                event_type="VERIFY_OTP",
+                integration_type="ERP → Middleware",
+                endpoint="/api/method/middleware_app.api.payment.verify_otp",
+                request_data={"otp_verification_id": otp_verification_id, "attempt": verification.attempt_count},
+                response_data=response_data,
+                http_status=200,
+                success=False,
+                error_message="OTP Mismatch"
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Mismatch {otp_verification_id}")
+
         return response_data
 
     transaction = frappe.get_doc({
@@ -129,6 +139,7 @@ def verify_otp(
         "payment_status": "Pending",
         "custom_sender_account": sender_account,
         "custom_receiver_bank_account": receiver_bank_account,
+        "custom_receiver_account_number": receiver_account_number,
         "custom_mode_of_payment": mode_of_payment
     })
     transaction.insert(ignore_permissions=True)
@@ -145,38 +156,39 @@ def verify_otp(
         "message": "OTP verified. Payment transaction initiated."
     }
 
-    create_api_log(
-        transaction_id=transaction.name,
-        event_type="VERIFY_OTP",
-        integration_type="ERP → Middleware",
-        endpoint="/api/method/middleware_app.api.payment.verify_otp",
-        request_data=json.dumps({"otp_verification_id": otp_verification_id}),
-        response_data=json.dumps(response_data),
-        http_status=200,
-        success=True
-    )
+    try:
+        create_api_log(
+            transaction_id=transaction.name,
+            event_type="VERIFY_OTP",
+            integration_type="ERP → Middleware",
+            endpoint="/api/method/middleware_app.api.payment.verify_otp",
+            request_data={"otp_verification_id": otp_verification_id},
+            response_data=response_data,
+            http_status=200,
+            success=True
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Verify {transaction.name}")
 
     return response_data
 
 
-def mock_bank_initiate_payment(transaction_id, account_number, amount, mode_of_payment,sender_account,mobile):
+def mock_bank_initiate_payment(transaction_id, account_number, amount, mode_of_payment, sender_account, mobile):
+    sender_account_number = ''.join(filter(str.isdigit, mobile or ""))[-10:]
 
-     
-    sender_account_number = ''.join(filter(str.isdigit, mobile))[-10:]
- 
     doc_name = frappe.db.get_value(
-    "Bank Information",
-    {
-        "bank_name": sender_account,
-        "account_number": sender_account_number
-    },
-    "name"
+        "Bank Information",
+        {
+            "bank_name": sender_account,
+            "account_number": sender_account_number
+        },
+        "name"
     )
 
-    bank_info = frappe.get_doc("Bank Information", doc_name)
+    if not doc_name:
+        frappe.throw(f"Bank Information not configured for {sender_account}.")
 
-    print(bank_info)
-    print('THIS IS BANK INTIATING')
+    bank_info = frappe.get_doc("Bank Information", doc_name)
 
     url = bank_info.initiate_url
     api_key = bank_info.api_key
@@ -203,9 +215,6 @@ def mock_bank_initiate_payment(transaction_id, account_number, amount, mode_of_p
         "Accept": "application/json"
     }
 
-    print(payload)
-    print(headers)
-
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
     except requests.RequestException as e:
@@ -217,21 +226,24 @@ def mock_bank_initiate_payment(transaction_id, account_number, amount, mode_of_p
     except Exception:
         result = {"response_message": response.text}
 
-    create_api_log(
-    transaction_id=transaction_id,
-    event_type="PROCESS_PAYMENT",
-    integration_type="Middleware → Bank",
-    endpoint=url,
-    request_data=json.dumps(payload),
-    response_data=json.dumps(result),
-    http_status=response.status_code,
-    success=response.status_code in [200, 202],
-    error_message=(
-        result.get("response_message")
-        if response.status_code not in [200, 202]
-        else None
-    )
-    )
+    try:
+        create_api_log(
+            transaction_id=transaction_id,
+            event_type="PROCESS_PAYMENT",
+            integration_type="Middleware → Bank",
+            endpoint=url,
+            request_data=payload,
+            response_data=result,
+            http_status=response.status_code,
+            success=response.status_code in [200, 202],
+            error_message=(
+                result.get("response_message")
+                if response.status_code not in [200, 202]
+                else None
+            )
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"API Log Failed - Bank Initiate {transaction_id}")
 
     return {
         "success": response.status_code in [200, 202],
@@ -265,29 +277,29 @@ def process_payment(
     except frappe.DoesNotExistError:
         return {"success": False, "status": "FAILED", "message": "Payment transaction not found."}
 
-    create_api_log(
-        transaction_id=transaction_id,
-        event_type="START_PAYMENT",
-        integration_type="ERP → Middleware",
-        endpoint="/api/method/middleware_app.api.payment.process_payment",
-        request_data=json.dumps({
-            "transaction_id": transaction_id,
-            "amount": amount,
-            "invoice_id": invoice_id,
-            "mobile": mobile,
-            "receiver_bank_account": receiver_bank_account,
-            "receiver_account_number": receiver_account_number,
-            "mode_of_payment": mode_of_payment,
-            "sender_account": sender_account,
-            "install_no": install_no
-        }),
-        response_data=json.dumps({
-            "message": "Payment processing started."
-        }),
-        http_status=200,
-        success=True
-    )
-
+    try:
+        create_api_log(
+            transaction_id=transaction_id,
+            event_type="START_PAYMENT",
+            integration_type="ERP → Middleware",
+            endpoint="/api/method/middleware_app.api.payment.process_payment",
+            request_data={
+                "transaction_id": transaction_id,
+                "amount": amount,
+                "invoice_id": invoice_id,
+                "mobile": mobile,
+                "receiver_bank_account": receiver_bank_account,
+                "receiver_account_number": receiver_account_number,
+                "mode_of_payment": mode_of_payment,
+                "sender_account": sender_account,
+                "install_no": install_no
+            },
+            response_data={"message": "Payment processing started."},
+            http_status=200,
+            success=True
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"API Log Failed - Start Payment {transaction_id}")
 
     if transaction.payment_status == "Success":
         return {
@@ -301,6 +313,8 @@ def process_payment(
 
     transaction.amount = flt(amount)
     transaction.payment_status = "Pending"
+    if receiver_account_number:
+        transaction.custom_receiver_account_number = receiver_account_number
     if install_no:
         transaction.install_no = install_no
     transaction.save(ignore_permissions=True)
@@ -308,13 +322,12 @@ def process_payment(
     try:
         bank_result = mock_bank_initiate_payment(
             transaction_id=transaction_id,
-            account_number=receiver_account_number,
+            account_number=receiver_account_number or transaction.get("custom_receiver_account_number"),
             amount=amount,
             mode_of_payment=mode_of_payment,
             sender_account=sender_account,
             mobile=mobile
         )
-        print(bank_result)
     except Exception as e:
         transaction.payment_status = "Failed"
         transaction.failure_reason = str(e)
@@ -332,28 +345,11 @@ def process_payment(
 
     bank_status = str(bank_result.get("status") or "").upper()
 
-    print(bank_status)
-
-    if bank_status == "COMPLETED":
-        transaction.payment_status = "Success"
-        transaction.bank_reference = bank_result.get("transaction_id")
-        transaction.failure_reason = None
-        transaction.processed_at = now()
-        transaction.save(ignore_permissions=True)
-
-        return {
-            "success": True,
-            "status": "SUCCESS",
-            "transaction_id": transaction_id,
-            "amount": amount,
-            "bank_reference": transaction.bank_reference,
-            "message": "Payment completed successfully."
-        }
-    
-    elif bank_status == "PENDING":
+    if bank_status in ["COMPLETED", "PENDING"]:
         transaction.payment_status = "Pending"
         transaction.bank_reference = bank_result.get("transaction_id")
         transaction.failure_reason = None
+        transaction.processed_at = now()
         transaction.save(ignore_permissions=True)
 
         return {
@@ -362,16 +358,14 @@ def process_payment(
             "transaction_id": transaction_id,
             "amount": amount,
             "bank_reference": transaction.bank_reference,
-            "message": "Payment processing is pending."
+            "message": "Payment initiated and pending bank confirmation."
         }
-
     else:
         transaction.payment_status = "Failed"
         transaction.bank_reference = bank_result.get("transaction_id")
         transaction.failure_reason = bank_result.get("message") or "Bank declined payment."
         transaction.processed_at = now()
         transaction.save(ignore_permissions=True)
-    
 
         return {
             "success": False,
@@ -384,15 +378,10 @@ def process_payment(
 
 
 def get_payment_status_from_bank(transaction):
-
     sender_account = transaction.custom_sender_account
     mobile = transaction.mobile
 
-    sender_account_number = ''.join(filter(str.isdigit, mobile))[-10:]
-
-    print("Sender Bank:", sender_account)
-    print("Mobile:", mobile)
-    print("Account Number:", sender_account_number)
+    sender_account_number = ''.join(filter(str.isdigit, mobile or ""))[-10:]
 
     doc_name = frappe.db.get_value(
         "Bank Information",
@@ -404,23 +393,11 @@ def get_payment_status_from_bank(transaction):
     )
 
     if not doc_name:
-        frappe.log_error(
-            f"Bank Information not found\n"
-            f"Bank Name: {sender_account}\n"
-            f"Account Number: {sender_account_number}\n"
-            f"Mobile: {mobile}",
-            "Bank Information Lookup"
-        )
-
-        # print("Bank Information not found")
-        # return None
+        frappe.log_error(f"Bank Information not found for {sender_account}", "Bank Information Lookup")
+        return None
 
     bank_info = frappe.get_doc("Bank Information", doc_name)
-
-    print(bank_info.as_dict())
-    print("IN CHECKING STATUS")
-
-    url = bank_info.initiate_url
+    url = bank_info.status_url
     api_key = bank_info.api_key
     api_secret = bank_info.api_secret
 
@@ -434,81 +411,72 @@ def get_payment_status_from_bank(transaction):
     }
 
     request_data = {
-    "unique_id": transaction.name
+        "unique_id": transaction.name
     }
 
     try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=request_data,
-            timeout=15
-        )
-        print(response)
-
-
+        response = requests.post(url, headers=headers, json=request_data, timeout=15)
         try:
             result = response.json()
-
         except Exception:
-            result = {
-                "response_message": response.text
-            }
+            result = {"response_message": response.text}
 
-
-
-        create_api_log(
-            transaction_id=transaction.name,
-            event_type="PAYMENT_STATUS",
-            integration_type="Middleware → Bank",
-            endpoint=url,
-            request_data=json.dumps(request_data),
-            response_data=json.dumps(result),
-            http_status=response.status_code,
-            success=response.status_code in [200, 202],
-            error_message=(
-                result.get("response_message")
-                if response.status_code not in [200, 202]
-                else None
+        try:
+            create_api_log(
+                transaction_id=transaction.name,
+                event_type="PAYMENT_STATUS",
+                integration_type="Middleware → Bank",
+                endpoint=url,
+                request_data=request_data,
+                response_data=result,
+                http_status=response.status_code,
+                success=response.status_code in [200, 202],
+                error_message=(
+                    result.get("response_message")
+                    if response.status_code not in [200, 202]
+                    else None
+                )
             )
-        )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"API Log Failed - Bank Status Polling {transaction.name}")
 
-
-        if response.status_code in [200, 202]:
-            return result
-
+        return result if response.status_code in [200, 202] else None
 
     except Exception as e:
+        try:
+            create_api_log(
+                transaction_id=transaction.name,
+                event_type="PAYMENT_STATUS",
+                integration_type="Middleware → Bank",
+                endpoint=url,
+                request_data=request_data,
+                response_data={"error": str(e)},
+                http_status=500,
+                success=False,
+                error_message=str(e)
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"API Log Failed - Network Failure {transaction.name}")
 
-        create_api_log(
-            transaction_id=transaction.name,
-            event_type="PAYMENT_STATUS",
-            integration_type="Middleware → Bank",
-            endpoint=url,
-            request_data=json.dumps(request_data),
-            response_data=json.dumps({
-                "error": str(e)
-            }),
-            http_status=500,
-            success=False,
-            error_message=str(e)
-        )
-
-        frappe.log_error(
-            frappe.get_traceback(),
-            f"Bank Polling Network Failure - {transaction.name}"
-        )
-
-    return result
-
-
-def handle_pending_success(transaction, result,request_id):
+        frappe.log_error(frappe.get_traceback(), f"Bank Polling Network Failure - {transaction.name}")
+        return None
+    
+def handle_pending_success(transaction, result, request_id):
 
     bank_reference = result.get("transaction_id")
 
+    # print("========================================")
+    # print("HANDLING SUCCESS PAYMENT")
+    # print("MIDDLEWARE TRANSACTION:", transaction.name)
+    # print("ERP INVOICE:", transaction.erp_invoice)
+    # print("INSTALL NO:", transaction.install_no)
+    # print("AMOUNT:", transaction.amount)
+    # print("BANK REFERENCE:", bank_reference)
+    # print("========================================")
+
     payload = {
         "invoice_id": transaction.erp_invoice,
-        "transaction_id":request_id,
+        "transaction_id": transaction.name,
         "amount": transaction.amount,
         "mobile": transaction.mobile,
         "status": "SUCCESS",
@@ -516,137 +484,425 @@ def handle_pending_success(transaction, result,request_id):
         "sender_account": transaction.custom_sender_account,
         "mode_of_payment": transaction.custom_mode_of_payment
     }
+
+    print("ERP PAYMENT RESULT PAYLOAD:")
+    print(payload)
+
+    ERP_URL = (
+        "http://erp.site:8000"
+        "/api/method/intial_app.api.payment.save_payment_result"
+    )
+
+    api_key = frappe.conf.get("payment_erp_api_key")
+    api_secret = frappe.conf.get("payment_erp_api_secret")
+
+    if not api_key or not api_secret:
+
+        frappe.log_error(
+            "ERP API credentials are missing.",
+            f"ERP Payment Sync Failed - {transaction.name}"
+        )
+
+        return False
+
+    headers = {
+        "Authorization": f"token {api_key}:{api_secret}",
+        "Content-Type": "application/json"
+    }
+
     try:
+
         response = requests.post(
-            "http://erp.site:8000/api/method/intial_app.api.payment.save_payment_result",
+            ERP_URL,
+            headers=headers,
             json=payload,
             timeout=30
         )
-        if response.status_code == 200:
-            frappe.db.set_value("Payment Transaction",request_id, {
+
+        print("ERP RESPONSE STATUS:", response.status_code)
+        print("ERP RESPONSE:", response.text)
+
+        if response.status_code != 200:
+
+            frappe.log_error(
+                            f"""
+            HTTP Status:
+            {response.status_code}
+
+            Response:
+            {response.text}
+
+            Payload:
+            {frappe.as_json(payload)}
+            """,
+                f"ERP Payment Sync Failed - {transaction.name}"
+            )
+
+            return False
+
+        try:
+            response_data = response.json()
+
+        except Exception:
+
+            frappe.log_error(
+                f"""
+                    ERP returned invalid JSON.
+
+                    Response:
+                    {response.text}
+
+                    Payload:
+                    {frappe.as_json(payload)}
+                    """,
+                f"ERP Invalid Response - {transaction.name}"
+            )
+
+            return False
+
+        print("ERP JSON:", response_data)
+
+        message = response_data.get("message")
+
+        if not message:
+
+            frappe.log_error(
+                                f"""
+                ERP response does not contain message.
+
+                Response:
+                {response.text}
+                """,
+                f"ERP Payment Sync Failed - {transaction.name}"
+            )
+
+            return False
+
+        if not message.get("success"):
+
+            frappe.log_error(
+         f"""
+            ERP returned success=False.
+
+            Response:
+            {response.text}
+
+            Payload:
+            {frappe.as_json(payload)}
+            """,
+                f"ERP Payment Sync Failed - {transaction.name}"
+            )
+
+            return False
+ 
+
+        frappe.db.set_value(
+            "Payment Transaction",
+            transaction.name,
+            {
                 "payment_status": "Success",
                 "bank_reference": bank_reference,
                 "processed_at": now()
-            })
-            frappe.db.commit()
-            
+            }
+        )
+
+        frappe.db.commit()
+
+        # print("========================================")
+        # print("PAYMENT SUCCESSFULLY SYNCED")
+        # print("TRANSACTION:", transaction.name)
+        # print("ERP RESPONSE:", message)
+        # print("========================================")
+
+        return True
+
     except Exception:
-        frappe.log_error(frappe.get_traceback(), f"ERP Sync Failure - {request_id}")
 
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"ERP Payment Sync Exception - {transaction.name}"
+        )
 
-def handle_pending_failure(transaction, result,request_id):
-    failure_reason = result.get("response_message") or "Bank declined payment."
+        return False
+def handle_pending_failure(transaction, result, request_id):
+
+    failure_reason = (
+        result.get("response_message")
+        or "Bank declined payment."
+    )
+
+    bank_reference = result.get("transaction_id")
 
     payload = {
         "invoice_id": transaction.erp_invoice,
-        "transaction_id":request_id,
+        "transaction_id": transaction.name,
         "amount": transaction.amount,
         "mobile": transaction.mobile,
         "status": "FAILED",
-        "bank_reference": result.get("transaction_id"),
-        "failure_reason": failure_reason
+        "bank_reference": bank_reference,
+        "failure_reason": failure_reason,
+        "sender_account": transaction.custom_sender_account,
+        "mode_of_payment": transaction.custom_mode_of_payment
     }
 
-    print('THIS REQ ID',request_id)
+    ERP_URL = (
+        "http://erp.site:8000"
+        "/api/method/intial_app.api.payment.save_payment_result"
+    )
+
+    api_key = frappe.conf.get("payment_erp_api_key")
+    api_secret = frappe.conf.get("payment_erp_api_secret")
+
+    if not api_key or not api_secret:
+
+        frappe.log_error(
+            "ERP API key or secret is missing.",
+            f"ERP Failure Sync - {transaction.name}"
+        )
+
+        return False
+
+    headers = {
+        "Authorization": f"token {api_key}:{api_secret}",
+        "Content-Type": "application/json"
+    }
 
     try:
-        requests.post(
-            "http://erp.site:8000/api/method/intial_app.api.payment.save_payment_result",
+
+        # print("========================================")
+        # print("HANDLING FAILED PAYMENT")
+        # print("TRANSACTION:", transaction.name)
+        # print("ERP INVOICE:", transaction.erp_invoice)
+        # print("INSTALL NO:", transaction.install_no)
+        # print("FAILURE REASON:", failure_reason)
+        # print("BANK REFERENCE:", bank_reference)
+        # print("========================================")
+
+        response = requests.post(
+            ERP_URL,
+            headers=headers,
             json=payload,
             timeout=30
         )
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), f"ERP Sync Failure on Rejection - {request_id}")
 
-    frappe.db.set_value("Payment Transaction", request_id, {
-        "payment_status": "Failed",
-        "bank_reference": result.get("transaction_id"),
-        "failure_reason": failure_reason,
-        "processed_at": now()
-    })
-    frappe.db.commit()
-    
-@frappe.whitelist(allow_guest=True)
-def check_pending_payments():
+        print("ERP FAILURE RESPONSE STATUS:", response.status_code)
+        print("ERP FAILURE RESPONSE:", response.text)
 
-    print("STARTED SCHEDULAR !!!!")
+        if response.status_code != 200:
 
-    pending_transactions = frappe.get_all(
-        "Payment Transaction",
-        filters={"payment_status": "Pending"},
-        fields=[
-            "name",
-            "erp_invoice",
-            "install_no",
-            "amount",
-            "mobile",
-            "custom_receiver_bank_account",
-            "custom_sender_account",
-            "custom_mode_of_payment"
-        ],
-        order_by="creation asc"
-    )
-
-    processed = 0
-    failed = 0
-    no_response = 0
-
-    for transaction in pending_transactions:
-        try:
-            result = get_payment_status_from_bank(transaction)
-            print(transaction.name)
-            print(transaction)
-            print(result)
-            if not result:
-                no_response += 1
-                continue
-
-            request_id =  result.request_id
-
-            status = str(
-                result.get("payment_status") or ""
-            ).upper()
-
-            print(status)
-
-            if status == "COMPLETED":
-                handle_pending_success(transaction, result,request_id)
-                processed += 1
-
-            elif status in ["FAILED", "REJECTED", "ERROR"]:
-                handle_pending_failure(transaction, result,request_id)
-                processed += 1
-
-        except Exception:
-            failed += 1
             frappe.log_error(
-                frappe.get_traceback(),
-                f"Pending Polling Loop Error - {transaction.name}"
+                f"""
+            ERP Failure Sync Failed
+
+            Transaction:
+            {transaction.name}
+
+            HTTP Status:
+            {response.status_code}
+
+            ERP Response:
+            {response.text}
+
+            Payload:
+            {frappe.as_json(payload)}
+            """,
+                f"ERP Failure Sync - {transaction.name}"
             )
 
-    return {
-        "success": True,
-        "message": "Pending payment check completed.",
-        "total_pending": len(pending_transactions),
-        "processed": processed,
-        "no_bank_response": no_response,
-        "failed": failed
-    }
+            return False
 
-# def remove_pending_otp():
-#     pending_otps = frappe.get_all(
-#         "OTP Verification",
-#         filters={"status": "Pending"},
-#         fields=["name"]
-#     )
+        try:
+            response_data = response.json()
+        except Exception:
 
-#     # frappe.log_error(
-#     # "AUTOMATIC SCHEDULER TEST",
-#     #     "Middleware Scheduler"
-#     # )
+            frappe.log_error(
+                                    f"""
+                    ERP returned invalid JSON.
 
-#     for otp in pending_otps:
-#         print(otp,"DELETED FROM OTP DOCTYPE VIA HOOKS")
-#         frappe.delete_doc("OTP Verification", otp.name)
+                    Transaction:
+                    {transaction.name}
 
-#     frappe.db.commit()
+                    Response:
+                    {response.text}
+                    """,
+                f"ERP Invalid Failure Response - {transaction.name}"
+            )
+
+            return False
+
+        print("ERP FAILURE JSON:", response_data)
+
+        message = response_data.get("message")
+
+        if not message:
+
+            frappe.log_error(
+                                    f"""
+                    ERP response does not contain message.
+
+                    Transaction:
+                    {transaction.name}
+
+                    Response:
+                    {response.text}
+                    """,
+                f"ERP Failure Sync - {transaction.name}"
+            )
+
+            return False
+
+        if not message.get("success"):
+
+            frappe.log_error(
+                f"""
+                    ERP returned success=False.
+
+                    Transaction:
+                    {transaction.name}
+
+                    Response:
+                    {response.text}
+                    """,
+                f"ERP Failure Sync - {transaction.name}"
+            )
+
+            return False
+
+
+        frappe.db.set_value(
+            "Payment Transaction",
+            transaction.name,
+            {
+                "payment_status": "Failed",
+                "bank_reference": bank_reference,
+                "failure_reason": failure_reason,
+                "processed_at": now()
+            }
+        )
+
+        frappe.db.commit()
+
+        # print("========================================")
+        # print("FAILED PAYMENT SUCCESSFULLY SYNCED")
+        # print("TRANSACTION:", transaction.name)
+        # print("========================================")
+
+        return True
+
+    except Exception:
+
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"ERP Sync Failure on Rejection - {transaction.name}"
+        )
+
+        return False
+
+
+@frappe.whitelist(allow_guest=True)
+def check_pending_payments():
+    lock_key = "middleware_payment_checker_lock"
+
+    if frappe.cache().get_value(lock_key):
+        return {
+            "success": True,
+            "message": "Payment checker is already running. Skipping run.",
+            "skipped": True
+        }
+
+   
+    frappe.cache().set_value(lock_key, "1", expires_in_sec=240)
+
+    try:
+        pending_transactions = frappe.get_all(
+            "Payment Transaction",
+            filters={
+                "payment_status": ["in", ["Pending", "Processing"]],
+                "amount": [">", 0]
+            },
+            fields=[
+                "name",
+                "erp_invoice",
+                "install_no",
+                "amount",
+                "mobile",
+                "custom_receiver_bank_account",
+                "custom_sender_account",
+                "custom_mode_of_payment"
+            ],
+            order_by="creation asc"
+        )
+
+        total_pending = len(pending_transactions)
+        processed = 0
+        failed = 0
+        no_response = 0
+
+        for transaction in pending_transactions:
+            try:
+                result = get_payment_status_from_bank(transaction)
+
+                if not result:
+                    no_response += 1
+                    continue
+
+                request_id = transaction.name
+
+                status = str(
+                    result.get("payment_status") or ""
+                ).upper()
+
+                # print("========================================")
+                # print("TRANSACTION:", transaction.name)
+                # print("BANK STATUS:", status)
+                # print("BANK RESPONSE:", result)
+                # print("========================================")
+
+                if status == "PENDING":
+
+                    continue
+
+                elif status in ["COMPLETED", "SUCCESS"]:
+
+                    if handle_pending_success(
+                        transaction,
+                        result,
+                        request_id
+                    ):
+                        processed += 1
+                    else:
+                        failed += 1
+
+                elif status in ["FAILED", "REJECTED", "ERROR"]:
+
+                    if handle_pending_failure(
+                        transaction,
+                        result,
+                        request_id
+                    ):
+                        processed += 1
+                    else:
+                        failed += 1
+
+                else:
+
+                    failed += 1
+
+            except Exception:
+                failed += 1
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"Pending Polling Loop Error - {transaction.name}"
+                )
+
+        return {
+            "success": True,
+            "message": "Pending payment check completed.",
+            "total_pending": total_pending,
+            "processed": processed,
+            "no_bank_response": no_response,
+            "failed": failed
+        }
+
+    finally:
+        frappe.cache().delete_value(lock_key)
