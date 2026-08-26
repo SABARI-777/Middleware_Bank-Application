@@ -314,12 +314,21 @@ def verify_otp(
         "amount": 0.0,
         "currency": "INR",
         "payment_status": "Pending",
+        "custom_initiation_status": "Not Initiated",
         "custom_sender_account": sender_account,
         "custom_receiver_bank_account": receiver_bank_account,
         "custom_receiver_account_number": receiver_account_number,
         "custom_mode_of_payment": mode_of_payment
     })
     transaction.insert(ignore_permissions=True)
+
+ 
+    create_pi_pending_entry(
+        transaction,
+        otp_verification_id
+    )
+
+    
 
     verification.status = "Verified"
     verification.verified_at = now()
@@ -429,6 +438,7 @@ def verify_bulk_otp(otp_verification_id, otp, invoices, mobile=None):
         if amount <= 0:
             frappe.throw(f"Payment amount for {invoice_id} must be greater than zero.")
 
+       
         transaction = frappe.get_doc({
             "doctype": "Payment Transaction",
             "erp_invoice": invoice_id,
@@ -437,12 +447,18 @@ def verify_bulk_otp(otp_verification_id, otp, invoices, mobile=None):
             "amount": amount,
             "currency": "INR",
             "payment_status": "Pending",
+            "custom_initiation_status": "Not Initiated",
             "custom_sender_account": sender_account,
             "custom_receiver_bank_account": receiver_bank_account,
             "custom_receiver_account_number": receiver_account_number,
             "custom_mode_of_payment": mode_of_payment
         })
         transaction.insert(ignore_permissions=True)
+
+        create_pi_pending_entry(
+            transaction,
+            otp_verification_id
+        )
 
         transactions.append({
             "invoice_id": invoice_id,
@@ -461,7 +477,10 @@ def verify_bulk_otp(otp_verification_id, otp, invoices, mobile=None):
         "success": True,
         "otp_verification_id": otp_verification_id,
         "transactions": transactions,
-        "message": "OTP verified and bulk payment transactions initiated."
+        "message": (
+        "OTP verified. "
+        "Payment transaction created and waiting for initiation."
+    )
     }
 
     try:
@@ -483,6 +502,51 @@ def verify_bulk_otp(otp_verification_id, otp, invoices, mobile=None):
 
     return response_data
 
+def create_pi_pending_entry(transaction, otp_verification_id):
+
+    ERP_URL = (
+        "http://erp.site:8000"
+        "/api/method/intial_app.api.payment.create_processing_payment"
+    )
+
+    api_key = frappe.conf.get("payment_erp_api_key")
+    api_secret = frappe.conf.get("payment_erp_api_secret")
+
+    headers = {
+        "Authorization": f"token {api_key}:{api_secret}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "invoice_id": transaction.erp_invoice,
+        "amount": transaction.amount,
+        "mobile": transaction.mobile,
+        "transaction_id": transaction.name,
+        "sender_account": transaction.custom_sender_account,
+        "mode_of_payment": transaction.custom_mode_of_payment,
+        "otp_verification_id": otp_verification_id
+    }
+
+    response = requests.post(
+        ERP_URL,
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+
+    if response.status_code != 200:
+        frappe.throw(
+            f"ERP PI Pending Entry Failed: {response.text}"
+        )
+
+    result = response.json().get("message")
+
+    if not result or not result.get("success"):
+        frappe.throw(
+            "Failed to create Purchase Invoice payment entry."
+        )
+
+    return result
 
 def mock_bank_initiate_payment(transaction_id, account_number, amount, mode_of_payment, sender_account, mobile):
     sender_account_number = ''.join(filter(str.isdigit, mobile or ""))[-10:]
@@ -565,127 +629,6 @@ def mock_bank_initiate_payment(transaction_id, account_number, amount, mode_of_p
         "message": result.get("response_message"),
         "raw_response": result
     }
-
-
-@frappe.whitelist(allow_guest=True)
-def process_payment(
-    transaction_id,
-    amount,
-    invoice_id=None,
-    mobile=None,
-    receiver_bank_account=None,
-    receiver_account_number=None,
-    mode_of_payment=None,
-    sender_account=None,
-    install_no=None
-):
-    if not transaction_id:
-        return {"success": False, "status": "FAILED", "message": "Transaction ID is required."}
-
-    try:
-        transaction = frappe.get_doc("Payment Transaction", transaction_id)
-    except frappe.DoesNotExistError:
-        return {"success": False, "status": "FAILED", "message": "Payment transaction not found."}
-
-    try:
-        create_api_log(
-            transaction_id=transaction_id,
-            event_type="START_PAYMENT",
-            integration_type="ERP → Middleware",
-            endpoint="/api/method/middleware_app.api.payment.process_payment",
-            request_data={
-                "transaction_id": transaction_id,
-                "amount": amount,
-                "invoice_id": invoice_id,
-                "mobile": mobile,
-                "receiver_bank_account": receiver_bank_account,
-                "receiver_account_number": receiver_account_number,
-                "mode_of_payment": mode_of_payment,
-                "sender_account": sender_account,
-                "install_no": install_no
-            },
-            response_data={"message": "Payment processing started."},
-            http_status=200,
-            success=True
-        )
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), f"API Log Failed - Start Payment {transaction_id}")
-
-    if transaction.payment_status == "Success":
-        return {
-            "success": True,
-            "status": "SUCCESS",
-            "transaction_id": transaction_id,
-            "bank_reference": transaction.bank_reference,
-            "amount": transaction.amount,
-            "message": "Transaction was already completed."
-        }
-
-    transaction.amount = flt(amount)
-    transaction.payment_status = "Pending"
-    if receiver_account_number:
-        transaction.custom_receiver_account_number = receiver_account_number
-    if install_no:
-        transaction.install_no = install_no
-    transaction.save(ignore_permissions=True)
-
-    try:
-        bank_result = mock_bank_initiate_payment(
-            transaction_id=transaction_id,
-            account_number=receiver_account_number or transaction.get("custom_receiver_account_number"),
-            amount=amount,
-            mode_of_payment=mode_of_payment,
-            sender_account=sender_account,
-            mobile=mobile
-        )
-    except Exception as e:
-        transaction.payment_status = "Failed"
-        transaction.failure_reason = str(e)
-        transaction.processed_at = now()
-        transaction.save(ignore_permissions=True)
-
-        return {
-            "success": False,
-            "status": "FAILED",
-            "transaction_id": transaction_id,
-            "amount": amount,
-            "reason": str(e),
-            "message": "Bank gateway connection failed."
-        }
-
-    bank_status = str(bank_result.get("status") or "").upper()
-
-    if bank_status in ["COMPLETED", "PENDING"]:
-        transaction.payment_status = "Pending"
-        transaction.bank_reference = bank_result.get("transaction_id")
-        transaction.failure_reason = None
-        transaction.processed_at = now()
-        transaction.save(ignore_permissions=True)
-
-        return {
-            "success": True,
-            "status": "PENDING",
-            "transaction_id": transaction_id,
-            "amount": amount,
-            "bank_reference": transaction.bank_reference,
-            "message": "Payment initiated and pending bank confirmation."
-        }
-    else:
-        transaction.payment_status = "Failed"
-        transaction.bank_reference = bank_result.get("transaction_id")
-        transaction.failure_reason = bank_result.get("message") or "Bank declined payment."
-        transaction.processed_at = now()
-        transaction.save(ignore_permissions=True)
-
-        return {
-            "success": False,
-            "status": "FAILED",
-            "transaction_id": transaction_id,
-            "amount": amount,
-            "reason": transaction.failure_reason,
-            "message": "Payment declined."
-        }
-
 
 def get_payment_status_from_bank(transaction):
     sender_account = transaction.custom_sender_account
@@ -927,25 +870,35 @@ def handle_pending_failure(transaction, result, request_id):
         )
         return False
 
-
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist()
 def check_pending_payments():
+
     lock_key = "middleware_payment_checker_lock"
 
     if frappe.cache().get_value(lock_key):
+
         return {
             "success": True,
-            "message": "Payment checker is already running. Skipping run.",
+            "message": (
+                "Payment checker is already running. "
+                "Skipping run."
+            ),
             "skipped": True
         }
 
-    frappe.cache().set_value(lock_key, "1", expires_in_sec=240)
+    frappe.cache().set_value(
+        lock_key,
+        "1",
+        expires_in_sec=240
+    )
 
     try:
+
         pending_transactions = frappe.get_all(
             "Payment Transaction",
             filters={
-                "payment_status": ["in", ["Pending", "Processing"]],
+                "payment_status": "Pending",
+                "custom_initiation_status": "Initiated",
                 "amount": [">", 0]
             },
             fields=[
@@ -961,47 +914,97 @@ def check_pending_payments():
             order_by="creation asc"
         )
 
-        total_pending = len(pending_transactions)
+        total_pending = len(
+            pending_transactions
+        )
+
         processed = 0
         failed = 0
         no_response = 0
 
         for transaction in pending_transactions:
+
             try:
-                result = get_payment_status_from_bank(transaction)
+
+                result = get_payment_status_from_bank(
+                    transaction
+                )
 
                 if not result:
                     no_response += 1
                     continue
 
                 request_id = transaction.name
-                status = str(result.get("payment_status") or "").upper()
+
+                status = str(
+                    result.get("payment_status")
+                    or result.get("status")
+                    or ""
+                ).upper()
+
 
                 if status == "PENDING":
                     continue
-                elif status in ["COMPLETED", "SUCCESS"]:
-                    if handle_pending_success(transaction, result, request_id):
+                elif status in (
+                    "COMPLETED",
+                    "SUCCESS"
+                ):
+
+                    if handle_pending_success(
+                        transaction,
+                        result,
+                        request_id
+                    ):
                         processed += 1
                     else:
                         failed += 1
-                elif status in ["FAILED", "REJECTED", "ERROR"]:
-                    if handle_pending_failure(transaction, result, request_id):
+                elif status in (
+                    "FAILED",
+                    "REJECTED",
+                    "ERROR",
+                    "FAILURE"
+                ):
+
+                    if handle_pending_failure(
+                        transaction,
+                        result,
+                        request_id
+                    ):
                         processed += 1
                     else:
                         failed += 1
+
                 else:
+
                     failed += 1
 
+                    frappe.log_error(
+                        frappe.as_json(result),
+                        (
+                            "Unknown Payment Status - "
+                            f"{transaction.name}"
+                        )
+                    )
+
             except Exception:
+
                 failed += 1
+
                 frappe.log_error(
                     frappe.get_traceback(),
-                    f"Pending Polling Loop Error - {transaction.name}"
+                    (
+                        "Pending Polling Loop Error - "
+                        f"{transaction.name}"
+                    )
                 )
+
+        frappe.db.commit()
 
         return {
             "success": True,
-            "message": "Pending payment check completed.",
+            "message": (
+                "Pending payment check completed."
+            ),
             "total_pending": total_pending,
             "processed": processed,
             "no_bank_response": no_response,
@@ -1009,4 +1012,324 @@ def check_pending_payments():
         }
 
     finally:
-        frappe.cache().delete_value(lock_key)
+
+        frappe.cache().delete_value(
+            lock_key
+        )
+@frappe.whitelist()
+def initiate_payment(transaction_id):
+
+    if not transaction_id:
+        frappe.throw("Payment Transaction ID is required.")
+
+   
+    try:
+        transaction = frappe.get_doc(
+            "Payment Transaction",
+            transaction_id
+        )
+    except frappe.DoesNotExistError:
+        frappe.throw(
+            f"Payment Transaction {transaction_id} not found."
+        )
+
+    if transaction.payment_status != "Pending":
+        return {
+            "success": False,
+            "status": transaction.payment_status,
+            "transaction_id": transaction.name,
+            "message": (
+                "Payment Transaction is not Pending."
+            )
+        }
+
+    if transaction.custom_initiation_status != "Not Initiated":
+        return {
+            "success": False,
+            "status": "ALREADY_INITIATED",
+            "transaction_id": transaction.name,
+            "message": (
+                "Payment Transaction is already initiated."
+            )
+        }
+
+    amount = flt(transaction.amount)
+    mobile = transaction.mobile
+
+    sender_account = (
+        transaction.custom_sender_account
+    )
+
+    receiver_account_number = (
+        transaction.custom_receiver_account_number
+    )
+
+    mode_of_payment = (
+        transaction.custom_mode_of_payment
+    )
+
+
+    if amount <= 0:
+        frappe.throw(
+            "Payment amount must be greater than zero."
+        )
+
+    if not sender_account:
+        frappe.throw(
+            "Sender Account is missing."
+        )
+
+    if not receiver_account_number:
+        frappe.throw(
+            "Receiver Account Number is missing."
+        )
+
+    if not mode_of_payment:
+        frappe.throw(
+            "Mode of Payment is missing."
+        )
+
+    try:
+
+        bank_result = mock_bank_initiate_payment(
+            transaction_id=transaction.name,
+            account_number=receiver_account_number,
+            amount=amount,
+            mode_of_payment=mode_of_payment,
+            sender_account=sender_account,
+            mobile=mobile
+        )
+
+    except Exception as e:
+
+
+        transaction.db_set(
+            "payment_status",
+            "Failed",
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "failure_reason",
+            str(e),
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "processed_at",
+            now(),
+            update_modified=True
+        )
+
+        frappe.db.commit()
+
+        return {
+            "success": False,
+            "status": "FAILED",
+            "transaction_id": transaction.name,
+            "failure_reason": str(e),
+            "message": "Bank initiation failed."
+        }
+
+    bank_status = str(
+        bank_result.get("status")
+        or bank_result.get("payment_status")
+        or ""
+    ).strip().upper()
+
+    bank_reference = (
+        bank_result.get("transaction_id")
+        or bank_result.get("bank_reference")
+    )
+
+    failure_reason = (
+        bank_result.get("failure_reason")
+        or bank_result.get("response_message")
+        or bank_result.get("message")
+        or "Bank declined payment."
+    )
+
+
+    if bank_status in (
+        "FAILED",
+        "FAILURE",
+        "REJECTED",
+        "ERROR"
+    ):
+
+        transaction.db_set(
+            "payment_status",
+            "Failed",
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "failure_reason",
+            failure_reason,
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "bank_reference",
+            bank_reference,
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "processed_at",
+            now(),
+            update_modified=True
+        )
+
+        frappe.db.commit()
+
+        return {
+            "success": False,
+            "status": "FAILED",
+            "transaction_id": transaction.name,
+            "bank_reference": bank_reference,
+            "failure_reason": failure_reason
+        }
+
+    if bank_status in (
+        "PENDING",
+        "COMPLETED",
+        "SUCCESS"
+    ):
+
+        transaction.db_set(
+            "payment_status",
+            "Pending",
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "custom_initiation_status",
+            "Initiated",
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "bank_reference",
+            bank_reference,
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "failure_reason",
+            None,
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "processed_at",
+            now(),
+            update_modified=True
+        )
+
+        frappe.db.commit()
+
+        return {
+            "success": True,
+            "status": "INITIATED",
+            "transaction_id": transaction.name,
+            "bank_reference": bank_reference,
+            "message": (
+                "Payment initiated. "
+                "Scheduler will check bank status."
+            )
+        }
+
+    frappe.log_error(
+        frappe.as_json(bank_result),
+        f"Unknown Bank Initiation Response - {transaction.name}"
+    )
+
+    return {
+        "success": False,
+        "status": "UNKNOWN",
+        "transaction_id": transaction.name,
+        "message": "Unknown bank response."
+    }
+@frappe.whitelist()
+def initiate_pending_transactions():
+
+    lock_key = "middleware_payment_initiation_lock"
+
+    if frappe.cache().get_value(lock_key):
+        return {
+            "success": True,
+            "skipped": True,
+            "message": (
+                "Payment initiation scheduler "
+                "is already running."
+            )
+        }
+
+    frappe.cache().set_value(
+        lock_key,
+        "1",
+        expires_in_sec=240
+    )
+
+    processed = 0
+    failed = 0
+
+    try:
+
+        transactions = frappe.get_all(
+            "Payment Transaction",
+            filters={
+                "payment_status": "Pending",
+                "custom_initiation_status": "Not Initiated",
+                "amount": [">", 0]
+            },
+            fields=[
+                "name"
+            ],
+            order_by="creation asc"
+        )
+
+        for row in transactions:
+
+            transaction_id = row.name
+
+            try:
+
+                result = initiate_payment(
+                    transaction_id=transaction_id
+                )
+
+                if result.get("success"):
+                    processed += 1
+                else:
+                    failed += 1
+
+            except Exception:
+
+                failed += 1
+
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    (
+                        "Payment Initiation Scheduler "
+                        f"Failed - {transaction_id}"
+                    )
+                )
+
+        frappe.db.commit()
+
+        return {
+            "success": True,
+            "processed": processed,
+            "failed": failed,
+            "message": (
+                "Payment initiation scheduler completed."
+            )
+        }
+
+    finally:
+
+        frappe.cache().delete_value(
+            lock_key
+        )
