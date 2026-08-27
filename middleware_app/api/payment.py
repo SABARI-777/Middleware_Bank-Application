@@ -486,7 +486,7 @@ def verify_bulk_otp(otp_verification_id, otp, invoices, mobile=None):
     try:
         create_api_log(
             transaction_id=otp_verification_id,
-            event_type="VERIFY_BULK_OTP",
+            event_type="VERIFY_OTP",
             integration_type="ERP → Middleware",
             endpoint="/api/method/middleware_app.api.payment.verify_bulk_otp",
             request_data={
@@ -800,7 +800,7 @@ def handle_pending_failure(transaction, result, request_id):
         "install_no": transaction.install_no,
         "amount": transaction.amount,
         "mobile": transaction.mobile,
-        "status": "FAILED",
+        "status": "Failed",
         "bank_reference": bank_reference,
         "failure_reason": failure_reason,
         "sender_account": transaction.custom_sender_account,
@@ -853,12 +853,13 @@ def handle_pending_failure(transaction, result, request_id):
         frappe.db.set_value(
             "Payment Transaction",
             transaction.name,
-            {
-                "payment_status": "Failed",
-                "bank_reference": bank_reference,
-                "failure_reason": failure_reason,
-                "processed_at": now()
-            }
+                {
+                    "payment_status": "Failed",
+                    "custom_initiation_status": "Failed",
+                    "bank_reference": bank_reference,
+                    "failure_reason": failure_reason,
+                    "processed_at": now()
+                }
         )
         frappe.db.commit()
         return True
@@ -1102,16 +1103,23 @@ def initiate_payment(transaction_id):
 
     except Exception as e:
 
+        failure_reason = str(e)
 
+    
         transaction.db_set(
             "payment_status",
+            "Failed",
+            update_modified=True
+        )
+        transaction.db_set(
+            "custom_initiation_status",
             "Failed",
             update_modified=True
         )
 
         transaction.db_set(
             "failure_reason",
-            str(e),
+            failure_reason,
             update_modified=True
         )
 
@@ -1121,13 +1129,95 @@ def initiate_payment(transaction_id):
             update_modified=True
         )
 
+        try:
+
+            payload = {
+                "invoice_id": transaction.erp_invoice,
+                "transaction_id": transaction.name,
+                "install_no": transaction.install_no,
+                "amount": transaction.amount,
+                "mobile": transaction.mobile,
+                "status": "FAILED",
+                "bank_reference": None,
+                "failure_reason": failure_reason,
+                "sender_account": transaction.custom_sender_account,
+                "mode_of_payment": transaction.custom_mode_of_payment
+            }
+
+            ERP_URL = (
+                "http://erp.site:8000"
+                "/api/method/intial_app.api.payment.save_payment_result"
+            )
+
+            api_key = frappe.conf.get("payment_erp_api_key")
+            api_secret = frappe.conf.get("payment_erp_api_secret")
+
+            headers = {
+                "Authorization": f"token {api_key}:{api_secret}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(
+                ERP_URL,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+
+            if response.status_code != 200:
+
+                frappe.log_error(
+                    (
+                        f"HTTP Status: {response.status_code}\n"
+                        f"Response: {response.text}\n"
+                        f"Payload: {frappe.as_json(payload)}"
+                    ),
+                    f"ERP Initiation Failure Sync - {transaction.name}"
+                )
+
+            else:
+
+                try:
+                    response_data = response.json()
+                    message = response_data.get("message")
+
+                    if not message or not message.get("success"):
+
+                        frappe.log_error(
+                            (
+                                f"ERP returned success=False.\n"
+                                f"Transaction: {transaction.name}\n"
+                                f"Response: {response.text}\n"
+                                f"Payload: {frappe.as_json(payload)}"
+                            ),
+                            f"ERP Initiation Failure Sync - {transaction.name}"
+                        )
+
+                except Exception:
+
+                    frappe.log_error(
+                        (
+                            f"ERP returned invalid JSON.\n"
+                            f"Transaction: {transaction.name}\n"
+                            f"Response: {response.text}"
+                        ),
+                        f"ERP Initiation Failure Invalid Response - {transaction.name}"
+                    )
+
+        except Exception:
+
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"ERP Initiation Failure Sync Exception - {transaction.name}"
+            )
+
         frappe.db.commit()
 
         return {
             "success": False,
             "status": "FAILED",
             "transaction_id": transaction.name,
-            "failure_reason": str(e),
+            "failure_reason": failure_reason,
             "message": "Bank initiation failed."
         }
 
@@ -1151,14 +1241,22 @@ def initiate_payment(transaction_id):
 
 
     if bank_status in (
-        "FAILED",
-        "FAILURE",
-        "REJECTED",
-        "ERROR"
-    ):
+    "FAILED",
+    "FAILURE",
+    "REJECTED",
+    "ERROR"
+):
+
+      
 
         transaction.db_set(
             "payment_status",
+            "Failed",
+            update_modified=True
+        )
+
+        transaction.db_set(
+            "custom_initiation_status",
             "Failed",
             update_modified=True
         )
@@ -1183,12 +1281,21 @@ def initiate_payment(transaction_id):
 
         frappe.db.commit()
 
+
+        erp_sync_success = sync_failure_to_erp(
+            transaction,
+            failure_reason
+        )
+
+      
+
         return {
             "success": False,
             "status": "FAILED",
             "transaction_id": transaction.name,
             "bank_reference": bank_reference,
-            "failure_reason": failure_reason
+            "failure_reason": failure_reason,
+            "erp_sync": erp_sync_success
         }
 
     if bank_status in (
@@ -1333,3 +1440,62 @@ def initiate_pending_transactions():
         frappe.cache().delete_value(
             lock_key
         )
+def sync_failure_to_erp(transaction, failure_reason):
+
+    payload = {
+        "invoice_id": transaction.erp_invoice,
+        "transaction_id": transaction.name,
+        "install_no": transaction.install_no,
+        "amount": transaction.amount,
+        "mobile": transaction.mobile,
+        "status": "FAILED",
+        "bank_reference": transaction.bank_reference,
+        "failure_reason": failure_reason,
+        "sender_account": transaction.custom_sender_account,
+        "mode_of_payment": transaction.custom_mode_of_payment
+    }
+
+    ERP_URL = (
+        "http://erp.site:8000"
+        "/api/method/intial_app.api.payment.save_payment_result"
+    )
+
+    api_key = frappe.conf.get("payment_erp_api_key")
+    api_secret = frappe.conf.get("payment_erp_api_secret")
+
+    headers = {
+        "Authorization": f"token {api_key}:{api_secret}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(
+            ERP_URL,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            frappe.log_error(
+                (
+                    f"Transaction: {transaction.name}\n"
+                    f"HTTP: {response.status_code}\n"
+                    f"Response: {response.text}"
+                ),
+                "ERP Payment Failure Sync"
+            )
+            return False
+
+        result = response.json().get("message")
+
+        return bool(
+            result and result.get("success")
+        )
+
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"ERP Failure Sync - {transaction.name}"
+        )
+        return False
