@@ -20,6 +20,390 @@ def send_otp_sms(mobile, otp):
     frappe.logger().info(f"SMS Dispatch -> {mobile}: {message}")
     return True
 
+@frappe.whitelist(allow_guest=True)
+def request_otp(mobile):
+    if not mobile:
+        frappe.throw("Mobile number is required.")
+
+    otp = generate_otp()
+    print(otp)
+    otp_hash_value = hash_otp(otp)
+
+    verification = frappe.get_doc({
+        "doctype": "OTP Verification",
+        "mobile": mobile,
+        "otp_hash": otp_hash_value,
+        "attempt_count": 0,
+        "status": "Pending",
+        "created_at": now()
+    })
+    verification.insert(ignore_permissions=True)
+
+    send_otp_sms(mobile, otp)
+
+    response_data = {
+        "success": True,
+        "otp_verification_id": verification.name,
+        "message": "OTP dispatched successfully."
+    }
+
+    try:
+        create_api_log(
+            transaction_id=verification.name,
+            event_type="GENERATE_OTP",
+            integration_type="ERP → Middleware",
+            endpoint="/api/method/middleware_app.api.payment.request_otp",
+            request_data={"mobile": mobile},
+            response_data=response_data,
+            http_status=200,
+            success=True
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Request {verification.name}")
+
+    return response_data
+
+
+@frappe.whitelist(allow_guest=True)
+def verify_otp(
+    otp_verification_id,
+    otp,
+    invoice_id=None,
+    mobile=None,
+    install_no=None,
+    receiver_bank_account=None,
+    receiver_account_number=None,
+    mode_of_payment=None,
+    sender_account=None
+):
+    if not otp_verification_id or not otp:
+        frappe.throw("OTP Verification ID and OTP are required.")
+
+    try:
+        verification = frappe.get_doc("OTP Verification", otp_verification_id)
+    except frappe.DoesNotExistError:
+        return {"success": False, "message": "OTP Verification record not found."}
+
+    if verification.status == "Verified":
+        return {"success": False, "message": "OTP is already verified."}
+
+    if verification.attempt_count >= 3:
+        return {
+            "success": False,
+            "max_attempts": True,
+            "attempt_count": verification.attempt_count,
+            "message": "Maximum 3 OTP attempts exceeded."
+        }
+
+    entered_hash = hash_otp(otp)
+
+    if entered_hash != verification.otp_hash:
+        verification.attempt_count += 1
+        if verification.attempt_count >= 3:
+            verification.status = "Failed"
+        verification.save(ignore_permissions=True)
+
+        save_single_otp_failure_to_erp(
+            otp_verification_id=otp_verification_id,
+            invoice_id=invoice_id,
+            error="Invalid OTP entered.",
+            otp_entered=otp,
+            mobile=mobile or verification.mobile,
+            attempt_no=verification.attempt_count
+    )
+        response_data = {
+            "success": False,
+            "otp_verification_id": otp_verification_id,
+            "attempt_count": verification.attempt_count,
+            "max_attempts": verification.attempt_count >= 3,
+            "message": "Invalid OTP entered."
+        }
+
+        try:
+            create_api_log(
+                transaction_id=otp_verification_id,
+                event_type="VERIFY_OTP",
+                integration_type="ERP → Middleware",
+                endpoint="/api/method/middleware_app.api.payment.verify_otp",
+                request_data={"otp_verification_id": otp_verification_id, "attempt": verification.attempt_count},
+                response_data=response_data,
+                http_status=200,
+                success=False,
+                error_message="OTP Mismatch"
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Mismatch {otp_verification_id}")
+
+        return response_data
+
+    transaction = frappe.get_doc({
+        "doctype": "Payment Transaction",
+        "erp_invoice": invoice_id,
+        "install_no": install_no,
+        "mobile": mobile or verification.mobile,
+        "amount": 0.0,
+        "currency": "INR",
+        "payment_status": "Pending",
+        "custom_initiation_status": "Not Initiated",
+        "custom_sender_account": sender_account,
+        "custom_receiver_bank_account": receiver_bank_account,
+        "custom_receiver_account_number": receiver_account_number,
+        "custom_mode_of_payment": mode_of_payment
+    })
+    transaction.insert(ignore_permissions=True)
+
+ 
+
+    
+
+    verification.status = "Verified"
+    verification.verified_at = now()
+    verification.transaction_id = transaction.name
+    verification.save(ignore_permissions=True)
+
+    response_data = {
+        "success": True,
+        "otp_verification_id": otp_verification_id,
+        "transaction_id": transaction.name,
+        "message": "OTP verified. Payment transaction created."
+    }
+
+    try:
+        create_api_log(
+            transaction_id=transaction.name,
+            event_type="VERIFY_OTP",
+            integration_type="ERP → Middleware",
+            endpoint="/api/method/middleware_app.api.payment.verify_otp",
+            request_data={"otp_verification_id": otp_verification_id},
+            response_data=response_data,
+            http_status=200,
+            success=True
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Verify {transaction.name}")
+
+    return response_data
+@frappe.whitelist(allow_guest=True)
+def process_payment(
+    transaction_id,
+    amount,
+    invoice_id=None,
+    mobile=None,
+    receiver_bank_account=None,
+    receiver_account_number=None,
+    mode_of_payment=None,
+    sender_account=None,
+    install_no=None
+):
+    amount = flt(amount)
+
+    if amount <= 0:
+        frappe.throw(
+            _("Payment amount must be greater than zero.")
+        )
+
+    if not transaction_id:
+        frappe.throw(
+            _("Transaction ID is required.")
+        )
+
+    transaction = frappe.get_doc(
+        "Payment Transaction",
+        transaction_id
+    )
+
+    transaction.amount = amount
+
+    if invoice_id:
+        transaction.erp_invoice = invoice_id
+
+    if mobile:
+        transaction.mobile = mobile
+
+    if receiver_bank_account:
+        transaction.custom_receiver_bank_account = (
+            receiver_bank_account
+        )
+
+    if receiver_account_number:
+        transaction.receiver_account_number = (
+            receiver_account_number
+        )
+
+    if mode_of_payment:
+        transaction.custom_mode_of_payment = (
+            mode_of_payment
+        )
+
+    if sender_account:
+        transaction.custom_sender_account = (
+            sender_account
+        )
+
+    if install_no:
+        transaction.install_no = install_no
+
+    transaction.payment_status = "Pending"
+    transaction.custom_initiation_status = "Not Initiated"
+
+    transaction.save(
+        ignore_permissions=True
+    )
+
+    frappe.db.commit()
+
+    return {
+        "success": True,
+        "transaction_id": transaction.name,
+        "amount": transaction.amount,
+        "status": transaction.payment_status,
+        "payment_status": transaction.payment_status,
+        "custom_initiation_status": transaction.custom_initiation_status
+    }
+
+@frappe.whitelist(allow_guest=True)
+def verify_bulk_otp(otp_verification_id, otp, invoices, mobile=None):
+    if not otp_verification_id or not otp:
+        frappe.throw("OTP Verification ID and OTP are required.")
+
+    if not invoices:
+        frappe.throw("Purchase Invoices are required.")
+
+    if isinstance(invoices, str):
+        invoices = frappe.parse_json(invoices)
+
+    if not isinstance(invoices, list):
+        frappe.throw("Invoices must be a list.")
+
+    try:
+        verification = frappe.get_doc("OTP Verification", otp_verification_id)
+    except frappe.DoesNotExistError:
+        return {"success": False, "message": "OTP Verification record not found."}
+
+    if verification.status == "Verified":
+        return {"success": False, "message": "OTP is already verified."}
+
+    if verification.attempt_count >= 3:
+        return {
+            "success": False,
+            "max_attempts": True,
+            "attempt_count": verification.attempt_count,
+            "message": "Maximum 3 OTP attempts exceeded."
+        }
+
+    entered_hash = hash_otp(otp)
+
+    if entered_hash != verification.otp_hash:
+
+        verification.attempt_count += 1
+
+        if verification.attempt_count >= 3:
+            verification.status = "Failed"
+
+        verification.save(
+            ignore_permissions=True
+        )
+
+        save_otp_failure_to_erp(
+            otp_verification_id=otp_verification_id,
+            invoices=invoices,
+            error="Invalid OTP entered.",
+            otp_entered=otp,
+            mobile=mobile or verification.mobile,
+            attempt_no=verification.attempt_count
+        )
+
+        response_data = {
+            "success": False,
+            "otp_verification_id": otp_verification_id,
+            "attempt_count": verification.attempt_count,
+            "max_attempts": verification.attempt_count >= 3,
+            "message": "Invalid OTP entered."
+        }
+
+        return response_data
+
+    transactions = []
+
+    for invoice_data in invoices:
+        invoice_id = invoice_data.get("invoice_id")
+        install_no = invoice_data.get("install_no")
+        amount = flt(invoice_data.get("amount") or 0)
+        receiver_bank_account = invoice_data.get("receiver_bank_account")
+        receiver_account_number = invoice_data.get("receiver_account_number")
+        mode_of_payment = invoice_data.get("mode_of_payment")
+        sender_account = invoice_data.get("sender_account")
+
+        if not invoice_id:
+            frappe.throw("Purchase Invoice ID is required.")
+
+        if amount <= 0:
+            frappe.throw(f"Payment amount for {invoice_id} must be greater than zero.")
+
+       
+        transaction = frappe.get_doc({
+            "doctype": "Payment Transaction",
+            "erp_invoice": invoice_id,
+            "install_no": install_no,
+            "mobile": mobile or verification.mobile,
+            "amount": amount,
+            "currency": "INR",
+            "payment_status": "Pending",
+            "custom_initiation_status": "Not Initiated",
+            "custom_sender_account": sender_account,
+            "custom_receiver_bank_account": receiver_bank_account,
+            "custom_receiver_account_number": receiver_account_number,
+            "custom_mode_of_payment": mode_of_payment
+        })
+        transaction.insert(ignore_permissions=True)
+
+        create_pi_pending_entry(
+            transaction,
+            otp_verification_id
+        )
+
+        transactions.append({
+            "invoice_id": invoice_id,
+            "transaction_id": transaction.name,
+            "install_no": install_no,
+            "amount": amount
+        })
+
+    verification.status = "Verified"
+    verification.verified_at = now()
+    if transactions:
+        verification.transaction_id = transactions[0]["transaction_id"]
+    verification.save(ignore_permissions=True)
+
+    response_data = {
+        "success": True,
+        "otp_verification_id": otp_verification_id,
+        "transactions": transactions,
+        "message": (
+        "OTP verified. "
+        "Payment transaction created and waiting for initiation."
+    )
+    }
+
+    try:
+        create_api_log(
+            transaction_id=otp_verification_id,
+            event_type="VERIFY_OTP",
+            integration_type="ERP → Middleware",
+            endpoint="/api/method/middleware_app.api.payment.verify_bulk_otp",
+            request_data={
+                "otp_verification_id": otp_verification_id,
+                "invoice_count": len(invoices)
+            },
+            response_data=response_data,
+            http_status=200,
+            success=True
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "API Log Failed - Bulk OTP Verify")
+
+    return response_data
+
 def save_otp_failure_to_erp(
     otp_verification_id,
     invoices,
@@ -190,317 +574,6 @@ def save_single_otp_failure_to_erp(
             f"Single OTP Failure ERP Sync Exception - {invoice_id}"
         )
 
-@frappe.whitelist(allow_guest=True)
-def request_otp(mobile):
-    if not mobile:
-        frappe.throw("Mobile number is required.")
-
-    otp = generate_otp()
-    print(otp)
-    otp_hash_value = hash_otp(otp)
-
-    verification = frappe.get_doc({
-        "doctype": "OTP Verification",
-        "mobile": mobile,
-        "otp_hash": otp_hash_value,
-        "attempt_count": 0,
-        "status": "Pending",
-        "created_at": now()
-    })
-    verification.insert(ignore_permissions=True)
-
-    send_otp_sms(mobile, otp)
-
-    response_data = {
-        "success": True,
-        "otp_verification_id": verification.name,
-        "message": "OTP dispatched successfully."
-    }
-
-    try:
-        create_api_log(
-            transaction_id=verification.name,
-            event_type="GENERATE_OTP",
-            integration_type="ERP → Middleware",
-            endpoint="/api/method/middleware_app.api.payment.request_otp",
-            request_data={"mobile": mobile},
-            response_data=response_data,
-            http_status=200,
-            success=True
-        )
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Request {verification.name}")
-
-    return response_data
-
-
-@frappe.whitelist(allow_guest=True)
-def verify_otp(
-    otp_verification_id,
-    otp,
-    invoice_id=None,
-    mobile=None,
-    install_no=None,
-    receiver_bank_account=None,
-    receiver_account_number=None,
-    mode_of_payment=None,
-    sender_account=None
-):
-    if not otp_verification_id or not otp:
-        frappe.throw("OTP Verification ID and OTP are required.")
-
-    try:
-        verification = frappe.get_doc("OTP Verification", otp_verification_id)
-    except frappe.DoesNotExistError:
-        return {"success": False, "message": "OTP Verification record not found."}
-
-    if verification.status == "Verified":
-        return {"success": False, "message": "OTP is already verified."}
-
-    if verification.attempt_count >= 3:
-        return {
-            "success": False,
-            "max_attempts": True,
-            "attempt_count": verification.attempt_count,
-            "message": "Maximum 3 OTP attempts exceeded."
-        }
-
-    entered_hash = hash_otp(otp)
-
-    if entered_hash != verification.otp_hash:
-        verification.attempt_count += 1
-        if verification.attempt_count >= 3:
-            verification.status = "Failed"
-        verification.save(ignore_permissions=True)
-
-        save_single_otp_failure_to_erp(
-            otp_verification_id=otp_verification_id,
-            invoice_id=invoice_id,
-            error="Invalid OTP entered.",
-            otp_entered=otp,
-            mobile=mobile or verification.mobile,
-            attempt_no=verification.attempt_count
-    )
-        response_data = {
-            "success": False,
-            "otp_verification_id": otp_verification_id,
-            "attempt_count": verification.attempt_count,
-            "max_attempts": verification.attempt_count >= 3,
-            "message": "Invalid OTP entered."
-        }
-
-        try:
-            create_api_log(
-                transaction_id=otp_verification_id,
-                event_type="VERIFY_OTP",
-                integration_type="ERP → Middleware",
-                endpoint="/api/method/middleware_app.api.payment.verify_otp",
-                request_data={"otp_verification_id": otp_verification_id, "attempt": verification.attempt_count},
-                response_data=response_data,
-                http_status=200,
-                success=False,
-                error_message="OTP Mismatch"
-            )
-        except Exception:
-            frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Mismatch {otp_verification_id}")
-
-        return response_data
-
-    transaction = frappe.get_doc({
-        "doctype": "Payment Transaction",
-        "erp_invoice": invoice_id,
-        "install_no": install_no,
-        "mobile": mobile or verification.mobile,
-        "amount": 0.0,
-        "currency": "INR",
-        "payment_status": "Pending",
-        "custom_initiation_status": "Not Initiated",
-        "custom_sender_account": sender_account,
-        "custom_receiver_bank_account": receiver_bank_account,
-        "custom_receiver_account_number": receiver_account_number,
-        "custom_mode_of_payment": mode_of_payment
-    })
-    transaction.insert(ignore_permissions=True)
-
- 
-    create_pi_pending_entry(
-        transaction,
-        otp_verification_id
-    )
-
-    
-
-    verification.status = "Verified"
-    verification.verified_at = now()
-    verification.transaction_id = transaction.name
-    verification.save(ignore_permissions=True)
-
-    response_data = {
-        "success": True,
-        "otp_verification_id": otp_verification_id,
-        "transaction_id": transaction.name,
-        "message": "OTP verified. Payment transaction initiated."
-    }
-
-    try:
-        create_api_log(
-            transaction_id=transaction.name,
-            event_type="VERIFY_OTP",
-            integration_type="ERP → Middleware",
-            endpoint="/api/method/middleware_app.api.payment.verify_otp",
-            request_data={"otp_verification_id": otp_verification_id},
-            response_data=response_data,
-            http_status=200,
-            success=True
-        )
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), f"API Log Failed - OTP Verify {transaction.name}")
-
-    return response_data
-
-
-@frappe.whitelist(allow_guest=True)
-def verify_bulk_otp(otp_verification_id, otp, invoices, mobile=None):
-    if not otp_verification_id or not otp:
-        frappe.throw("OTP Verification ID and OTP are required.")
-
-    if not invoices:
-        frappe.throw("Purchase Invoices are required.")
-
-    if isinstance(invoices, str):
-        invoices = frappe.parse_json(invoices)
-
-    if not isinstance(invoices, list):
-        frappe.throw("Invoices must be a list.")
-
-    try:
-        verification = frappe.get_doc("OTP Verification", otp_verification_id)
-    except frappe.DoesNotExistError:
-        return {"success": False, "message": "OTP Verification record not found."}
-
-    if verification.status == "Verified":
-        return {"success": False, "message": "OTP is already verified."}
-
-    if verification.attempt_count >= 3:
-        return {
-            "success": False,
-            "max_attempts": True,
-            "attempt_count": verification.attempt_count,
-            "message": "Maximum 3 OTP attempts exceeded."
-        }
-
-    entered_hash = hash_otp(otp)
-
-    if entered_hash != verification.otp_hash:
-
-        verification.attempt_count += 1
-
-        if verification.attempt_count >= 3:
-            verification.status = "Failed"
-
-        verification.save(
-            ignore_permissions=True
-        )
-
-        save_otp_failure_to_erp(
-            otp_verification_id=otp_verification_id,
-            invoices=invoices,
-            error="Invalid OTP entered.",
-            otp_entered=otp,
-            mobile=mobile or verification.mobile,
-            attempt_no=verification.attempt_count
-        )
-
-        response_data = {
-            "success": False,
-            "otp_verification_id": otp_verification_id,
-            "attempt_count": verification.attempt_count,
-            "max_attempts": verification.attempt_count >= 3,
-            "message": "Invalid OTP entered."
-        }
-
-        return response_data
-
-    transactions = []
-
-    for invoice_data in invoices:
-        invoice_id = invoice_data.get("invoice_id")
-        install_no = invoice_data.get("install_no")
-        amount = flt(invoice_data.get("amount") or 0)
-        receiver_bank_account = invoice_data.get("receiver_bank_account")
-        receiver_account_number = invoice_data.get("receiver_account_number")
-        mode_of_payment = invoice_data.get("mode_of_payment")
-        sender_account = invoice_data.get("sender_account")
-
-        if not invoice_id:
-            frappe.throw("Purchase Invoice ID is required.")
-
-        if amount <= 0:
-            frappe.throw(f"Payment amount for {invoice_id} must be greater than zero.")
-
-       
-        transaction = frappe.get_doc({
-            "doctype": "Payment Transaction",
-            "erp_invoice": invoice_id,
-            "install_no": install_no,
-            "mobile": mobile or verification.mobile,
-            "amount": amount,
-            "currency": "INR",
-            "payment_status": "Pending",
-            "custom_initiation_status": "Not Initiated",
-            "custom_sender_account": sender_account,
-            "custom_receiver_bank_account": receiver_bank_account,
-            "custom_receiver_account_number": receiver_account_number,
-            "custom_mode_of_payment": mode_of_payment
-        })
-        transaction.insert(ignore_permissions=True)
-
-        create_pi_pending_entry(
-            transaction,
-            otp_verification_id
-        )
-
-        transactions.append({
-            "invoice_id": invoice_id,
-            "transaction_id": transaction.name,
-            "install_no": install_no,
-            "amount": amount
-        })
-
-    verification.status = "Verified"
-    verification.verified_at = now()
-    if transactions:
-        verification.transaction_id = transactions[0]["transaction_id"]
-    verification.save(ignore_permissions=True)
-
-    response_data = {
-        "success": True,
-        "otp_verification_id": otp_verification_id,
-        "transactions": transactions,
-        "message": (
-        "OTP verified. "
-        "Payment transaction created and waiting for initiation."
-    )
-    }
-
-    try:
-        create_api_log(
-            transaction_id=otp_verification_id,
-            event_type="VERIFY_OTP",
-            integration_type="ERP → Middleware",
-            endpoint="/api/method/middleware_app.api.payment.verify_bulk_otp",
-            request_data={
-                "otp_verification_id": otp_verification_id,
-                "invoice_count": len(invoices)
-            },
-            response_data=response_data,
-            http_status=200,
-            success=True
-        )
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "API Log Failed - Bulk OTP Verify")
-
-    return response_data
 
 def create_pi_pending_entry(transaction, otp_verification_id):
 
